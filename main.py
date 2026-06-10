@@ -19,6 +19,39 @@ def get_required_env(name):
     return value
 
 
+def normalize_table_columns(table, expected_columns, table_name):
+    """Rename BigQuery columns to the names the app expects."""
+    column_lookup = {str(column).strip().lower(): column for column in table.columns}
+
+    if all(column in column_lookup for column in expected_columns):
+        rename_map = {column_lookup[column]: column for column in expected_columns}
+        table = table.rename(columns=rename_map)
+        return table[expected_columns]
+
+    if len(table.columns) >= len(expected_columns):
+        rename_map = {
+            original: expected
+            for original, expected in zip(table.columns, expected_columns)
+        }
+        table = table.rename(columns=rename_map)
+        table = table[expected_columns]
+
+        first_row_is_header = not table.empty and all(
+            str(table.iloc[0][column]).strip().lower() == column
+            for column in expected_columns
+        )
+
+        if first_row_is_header:
+            table = table.iloc[1:].reset_index(drop=True)
+
+        return table
+
+    raise RuntimeError(
+        f"{table_name} table has columns {list(table.columns)}, "
+        f"but expected {expected_columns}."
+    )
+
+
 def read_bigquery_tables():
     """Read the three source tables from BigQuery into pandas DataFrames."""
     client = bigquery.Client()
@@ -43,18 +76,25 @@ def read_bigquery_tables():
     """
 
     flow_ownership_sql = f"""
-        SELECT project, flow, owner
+        SELECT *
         FROM `{flow_ownership_table}`
     """
 
     project_ownership_sql = f"""
-        SELECT project, owner
+        SELECT *
         FROM `{project_ownership_table}`
     """
 
     costs = client.query(costs_sql).to_dataframe()
     flow_owners = client.query(flow_ownership_sql).to_dataframe()
     project_owners = client.query(project_ownership_sql).to_dataframe()
+
+    flow_owners = normalize_table_columns(
+        flow_owners, ["project", "flow", "owner"], "flow ownership"
+    )
+    project_owners = normalize_table_columns(
+        project_owners, ["project", "owner"], "project ownership"
+    )
 
     return costs, flow_owners, project_owners
 
@@ -66,6 +106,9 @@ def prepare_data(costs, flow_owners, project_owners):
 
     data = costs.merge(flow_owners, on=["project", "flow"], how="left")
     data = data.merge(project_owners, on="project", how="left")
+
+    data["flow_owner"] = data["flow_owner"].replace("", pd.NA)
+    data["project_owner"] = data["project_owner"].replace("", pd.NA)
 
     data["owner"] = data["flow_owner"]
     data["owner"] = data["owner"].fillna(data["project_owner"])
